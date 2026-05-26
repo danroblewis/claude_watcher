@@ -228,6 +228,31 @@ def test_derive_status_stalled():
     assert derive_status(entries, later).state is State.STALLED
 
 
+def _user(text, ts="2026-05-24T00:00:30Z"):
+    return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}}
+
+
+def test_derive_status_user_prompt_after_end_turn_is_working():
+    # The turn ended, then the user sent a follow-up; the reply hasn't been
+    # written yet, so the session is working, not idle.
+    entries = [
+        _assistant([{"type": "text", "text": "all done"}], stop_reason="end_turn"),
+        _user("now do the next thing"),
+    ]
+    assert derive_status(entries, NOW).state is State.WORKING
+
+
+def test_derive_status_trailing_tool_result_uses_assistant_state():
+    # A tool_result is mid-turn output, not a new prompt: state comes from the
+    # assistant tool_use that triggered it.
+    entries = [
+        _assistant([{"type": "tool_use", "name": "Bash", "input": {}}]),
+        {"type": "user", "timestamp": "2026-05-24T00:00:30Z",
+         "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}},
+    ]
+    assert derive_status(entries, NOW).state is State.WORKING
+
+
 def test_derive_status_idle_not_overridden_by_stall():
     entries = [_assistant([{"type": "text", "text": "done"}], stop_reason="end_turn", ts="2026-05-24T00:00:00Z")]
     later = datetime(2026, 5, 24, 1, 0, 0, tzinfo=timezone.utc)

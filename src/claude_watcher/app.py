@@ -83,6 +83,11 @@ def _shorten_msg(text: str | None, width: int = 60) -> str:
     return flat
 
 
+def _msg_cell(text: str | None, state: State) -> Text:
+    """The MSG cell, dimmed once the session is idle (turn finished)."""
+    return Text(_shorten_msg(text), style="grey50" if state is State.IDLE else "")
+
+
 def _fmt_tokens(n: int | None) -> str:
     """Compact token count: 9070 -> "9.1k", 6284048 -> "6.3m"."""
     if n is None:
@@ -469,7 +474,7 @@ class ClaudeWatcherApp(App):
         if s.jsonl_path and not s.cwd_validated:
             cwd = "!" + cwd
         out_tok = _fmt_tokens(s.total_output_tokens)
-        msg = _shorten_msg(st.last_text if st else None)
+        msg = _msg_cell(st.last_text if st else None, state)
         # Disclosure marker when a session has subagents to expand into.
         marker = ""
         if s.subagent_paths:
@@ -489,12 +494,14 @@ class ClaudeWatcherApp(App):
 
     def _subagent_row_cells(self, info: SubagentInfo) -> list:
         st = info.status
+        state = st.state if st else State.UNKNOWN
         if info.active:
-            state = st.state if st else State.UNKNOWN
             state_cell = Text(state.value, style=_STATE_STYLE.get(state, "white"))
         else:
             state_cell = Text("done", style="grey50")
         tool = (st.tool_name if st and st.tool_name else "") or ""
+        # Dim a finished subagent's message, same as an idle session's.
+        msg_state = State.IDLE if not info.active else state
         return [
             Text(f"  └ {info.tag}", style="magenta"),
             "sub",
@@ -505,7 +512,7 @@ class ClaudeWatcherApp(App):
             "",  # CPU% — not a process
             _fmt_tokens(info.output_tokens),
             _ctx_cell(st),
-            _shorten_msg(st.last_text if st else None),
+            _msg_cell(st.last_text if st else None, msg_state),
         ]
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:

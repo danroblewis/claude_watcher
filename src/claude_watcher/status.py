@@ -200,9 +200,21 @@ def derive_status(
             status.last_ts = ts
             break
 
-    # State: first meaningful assistant entry from the end.
+    # State: from the most recent meaningful entry. A user prompt newer than
+    # the last assistant reply means a new turn is in flight (the reply isn't
+    # written yet) -> the session is working, not idle.
     for entry in reversed(entries):
-        if entry.get("type") != "assistant":
+        etype = entry.get("type")
+        if etype == "user":
+            items = _content_items(entry)
+            is_tool_result = any(
+                isinstance(it, dict) and it.get("type") == "tool_result" for it in items
+            )
+            if is_tool_result:
+                continue  # mid-turn tool output; let the assistant entry decide
+            status.state = State.WORKING  # a fresh prompt awaits a reply
+            break
+        if etype != "assistant":
             continue
         stop_reason = (entry.get("message") or {}).get("stop_reason")
         items = _content_items(entry)
