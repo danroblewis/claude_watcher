@@ -67,7 +67,6 @@ class SubagentInfo:
     path: str
     tag: str  # short id from the filename, e.g. "a16d"
     status: Status | None = None  # derived from the subagent's own transcript
-    output_tokens: int | None = None  # deduped output tokens for this subagent
     active: bool = False  # transcript written within the active window
 
 
@@ -83,7 +82,6 @@ class Session:
     status: Status | None = None
     file_size: int | None = None
     file_mtime: datetime | None = None  # UTC
-    total_output_tokens: int | None = None  # deduped sum across parent+subagents
     subagent_paths: list[str] = field(default_factory=list)  # all subagent transcripts
     subagents: list[SubagentInfo] = field(default_factory=list)  # populated when expanded
 

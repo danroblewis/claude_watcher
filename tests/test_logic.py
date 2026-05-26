@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 from claude_watcher.jsonl import read_incremental, read_tail
-from claude_watcher.tokens import TokenLedger
+from claude_watcher.transcripts import TranscriptTail
 from claude_watcher.models import State
 from claude_watcher.procs import classify_mode, is_watchable, terminate_proc
 from claude_watcher.models import Mode
@@ -363,116 +363,75 @@ def test_status_active_count_uses_real_now_not_parent_mtime(tmp_path):
     assert status.active_subagents == 1
 
 
-# -- token ledger -------------------------------------------------------------
+# -- transcript tail (last assistant text) ------------------------------------
 
-def _assistant_line(msg_id, out):
+def _text_line(text):
     return json.dumps(
-        {
-            "type": "assistant",
-            "message": {"id": msg_id, "role": "assistant", "usage": {"output_tokens": out}},
-        }
+        {"type": "assistant",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
     ) + "\n"
 
 
-def test_token_ledger_dedupes_and_includes_subagents(tmp_path):
-    parent = tmp_path / "sess.jsonl"
-    # msgA is logged across 3 content-block lines that repeat the same usage;
-    # it must count once (100), not 3x. msgB adds 50. A user line is ignored.
-    parent.write_text(
-        _assistant_line("msgA", 100) * 3
-        + _assistant_line("msgB", 50)
-        + '{"type": "user", "message": {"content": "hi"}}\n'
-    )
-    subs = tmp_path / "sess" / "subagents"
-    subs.mkdir(parents=True)
-    (subs / "agent-aaaa1111.jsonl").write_text(_assistant_line("msgC", 200) * 2)
-
-    ledger = TokenLedger()
-    # 150 (parent: 100 + 50) + 200 (subagent) = 350
-    assert ledger.output_tokens(str(parent)) == 350
-
-
-def test_token_ledger_incremental_no_double_count(tmp_path):
-    parent = tmp_path / "sess.jsonl"
-    parent.write_text(_assistant_line("msgA", 100))
-    ledger = TokenLedger()
-    assert ledger.output_tokens(str(parent)) == 100
-
-    # Append a new message plus a duplicate line of the already-counted msgA.
-    with open(parent, "a") as f:
-        f.write(_assistant_line("msgB", 25))
-        f.write(_assistant_line("msgA", 100))
-    assert ledger.output_tokens(str(parent)) == 125  # 100 + 25, msgA not doubled
-
-
-def _assistant_text_line(mid, text):
+def _tool_line():  # an assistant line with no text content
     return json.dumps(
-        {
-            "type": "assistant",
-            "message": {
-                "id": mid,
-                "role": "assistant",
-                "content": [{"type": "text", "text": text}],
-                "usage": {"output_tokens": 1},
-            },
-        }
+        {"type": "assistant",
+         "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}
     ) + "\n"
 
 
-def test_token_ledger_tracks_last_text_past_the_tail(tmp_path):
+def test_transcript_tail_tracks_last_text_past_the_tail(tmp_path):
     parent = tmp_path / "sess.jsonl"
-    # An old text message, then a lot of tool-only activity after it (no text).
-    parent.write_text(
-        _assistant_text_line("m1", "the last thing I said")
-        + _assistant_line("m2", 10) * 200  # tool/usage lines without any text
-    )
-    ledger = TokenLedger()
-    ledger.output_tokens(str(parent))
-    assert ledger.last_text(str(parent)) == "the last thing I said"
+    # An old text message, then a lot of tool-only activity after it.
+    parent.write_text(_text_line("the last thing I said") + _tool_line() * 200)
+    tail = TranscriptTail()
+    tail.update(str(parent))
+    assert tail.last_text(str(parent)) == "the last thing I said"
 
 
-def test_token_ledger_last_text_updates_and_persists(tmp_path):
+def test_transcript_tail_updates_and_persists(tmp_path):
     parent = tmp_path / "sess.jsonl"
-    parent.write_text(_assistant_text_line("m1", "first"))
-    ledger = TokenLedger()
-    ledger.output_tokens(str(parent))
-    assert ledger.last_text(str(parent)) == "first"
+    parent.write_text(_text_line("first"))
+    tail = TranscriptTail()
+    tail.update(str(parent))
+    assert tail.last_text(str(parent)) == "first"
 
     with open(parent, "a") as f:
-        f.write(_assistant_text_line("m2", "second"))
-    ledger.output_tokens(str(parent))
-    assert ledger.last_text(str(parent)) == "second"
+        f.write(_text_line("second"))
+    tail.update(str(parent))
+    assert tail.last_text(str(parent)) == "second"
 
     # Appending text-free lines must not blank the remembered message.
     with open(parent, "a") as f:
-        f.write(_assistant_line("m3", 5))
-    ledger.output_tokens(str(parent))
-    assert ledger.last_text(str(parent)) == "second"
+        f.write(_tool_line())
+    tail.update(str(parent))
+    assert tail.last_text(str(parent)) == "second"
 
 
-def test_token_ledger_per_file_output(tmp_path):
+def test_transcript_tail_includes_subagents(tmp_path):
     parent = tmp_path / "sess.jsonl"
-    parent.write_text(_assistant_line("msgA", 100))
+    parent.write_text(_text_line("parent says hi"))
     subs = tmp_path / "sess" / "subagents"
     subs.mkdir(parents=True)
     sub = subs / "agent-aaaa1111.jsonl"
-    sub.write_text(_assistant_line("msgC", 200))
+    sub.write_text(_text_line("subagent reply"))
 
-    ledger = TokenLedger()
-    assert ledger.file_output_tokens(str(sub)) is None  # not ingested yet
-    ledger.output_tokens(str(parent))  # ingests parent + subagents
-    assert ledger.file_output_tokens(str(parent)) == 100
-    assert ledger.file_output_tokens(str(sub)) == 200
+    tail = TranscriptTail()
+    assert tail.last_text(str(sub)) is None  # not ingested yet
+    tail.update(str(parent))  # ingests parent + subagents
+    assert tail.last_text(str(parent)) == "parent says hi"
+    assert tail.last_text(str(sub)) == "subagent reply"
 
 
-def test_token_ledger_recounts_after_truncation(tmp_path):
+def test_transcript_tail_resets_after_truncation(tmp_path):
     parent = tmp_path / "sess.jsonl"
-    parent.write_text(_assistant_line("msgA", 100) + _assistant_line("msgB", 50))
-    ledger = TokenLedger()
-    assert ledger.output_tokens(str(parent)) == 150
+    parent.write_text(_text_line("the original message, nice and long"))
+    tail = TranscriptTail()
+    tail.update(str(parent))
+    assert tail.last_text(str(parent)) == "the original message, nice and long"
 
-    parent.write_text(_assistant_line("msgC", 30))  # shrinks the file
-    assert ledger.output_tokens(str(parent)) == 30
+    parent.write_text(_text_line("fresh"))  # shorter file -> detected as truncation
+    tail.update(str(parent))
+    assert tail.last_text(str(parent)) == "fresh"
 
 
 # -- runtime state overrides --------------------------------------------------

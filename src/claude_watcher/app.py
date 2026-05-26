@@ -33,11 +33,12 @@ from claude_watcher.sessions import (
     list_subagent_files,
 )
 from claude_watcher.status import derive_status, parse_entry
-from claude_watcher.tokens import TokenLedger
+from claude_watcher.transcripts import TranscriptTail
 
 PROC_INTERVAL = 2.0
 FEED_INTERVAL = 0.75
 SEED_EVENTS = 25  # how many recent feed lines to show when selecting a session
+CONTEXT_WINDOW = 1_000_000  # assumed window for the CTX % (the 1M beta)
 
 _HOME = str(Path.home())
 
@@ -97,17 +98,6 @@ def _fmt_model(model: str | None) -> str:
     return re.sub(r"-\d{8}$", "", name)  # drop a trailing date snapshot
 
 
-def _fmt_tokens(n: int | None) -> str:
-    """Compact token count: 9070 -> "9.1k", 6284048 -> "6.3m"."""
-    if n is None:
-        return ""
-    if n < 1000:
-        return str(n)
-    if n < 999_500:  # below the point where rounding would print "1000.0k"
-        return f"{n / 1000:.1f}k"
-    return f"{n / 1_000_000:.1f}m"
-
-
 def _split_height(mouse_y: int, top: int, bottom: int, min_above: int = 3, min_below: int = 3) -> int:
     """Height (rows) for the pane above a splitter dragged to screen row
     `mouse_y`, where the stack spans rows [top, bottom). The splitter itself
@@ -158,10 +148,13 @@ class Splitter(Static):
 
 
 def _ctx_cell(st) -> Text:
-    """Context size as a raw token count (input + cache). We can't show a
-    percentage because the transcript doesn't record the window — a 200k and a
-    1M-beta session look identical until the latter passes 200k."""
-    return Text(_fmt_tokens(st.context_tokens if st else None))
+    """Context fill as a percent of the assumed window, color-coded."""
+    ct = st.context_tokens if st else None
+    if ct is None:
+        return Text("")
+    pct = 100 * ct / CONTEXT_WINDOW
+    style = "green" if pct < 50 else "yellow" if pct < 80 else "bold red"
+    return Text(f"{pct:.0f}%", style=style)
 
 
 def _fmt_time(ts: datetime | None) -> str:
@@ -322,7 +315,7 @@ class ClaudeWatcherApp(App):
     def __init__(self) -> None:
         super().__init__()
         self._self_pid = os.getpid()
-        self._ledger = TokenLedger()
+        self._ledger = TranscriptTail()
         self._sessions: dict[int, Session] = {}
         self._expanded: set[int] = set()  # pids whose subagents are shown
         self._show_done: bool = True  # global (d): whether the 'N done' row appears
@@ -347,7 +340,7 @@ class ClaudeWatcherApp(App):
     def on_mount(self) -> None:
         table = self.query_one("#procs", DataTable)
         table.add_columns(
-            "PID", "MODE", "STATE", "TOOL", "CWD", "ETIME", "CPU%", "OUT-TOK", "CTX", "MODEL", "MSG"
+            "PID", "MODE", "STATE", "TOOL", "CWD", "ETIME", "CPU%", "CTX", "MODEL", "MSG"
         )
         feed = self.query_one("#feed", RichLog)
         feed.write(Text("Select a session (↑/↓) to watch its live feed.", style="grey50"))
@@ -366,14 +359,14 @@ class ClaudeWatcherApp(App):
     def _discover_blocking(self) -> list[Session]:
         procs = discover_procs(self._self_pid)
         sessions = build_sessions(procs)
-        # Cumulative token accounting needs to scan whole files (parent +
-        # subagents), so it lives in the stateful ledger rather than the
-        # tail-window status. Runs here, off the event loop.
+        # Tracking the last assistant text needs to scan whole files (parent +
+        # subagents), so it lives in the stateful tail tracker. Runs here, off
+        # the event loop.
         for s in sessions:
             if not s.jsonl_path:
                 continue
-            s.total_output_tokens = self._ledger.output_tokens(s.jsonl_path)
-            # The ledger's last text spans the whole file, so MSG stays filled
+            self._ledger.update(s.jsonl_path)
+            # The tracker's last text spans the whole file, so MSG stays filled
             # even when the recent tail is all tool calls.
             if s.status is not None:
                 text = self._ledger.last_text(s.jsonl_path)
@@ -403,7 +396,6 @@ class ClaudeWatcherApp(App):
                     path=path,
                     tag=_agent_tag(path),
                     status=status,
-                    output_tokens=self._ledger.file_output_tokens(path),
                     active=active,
                 )
             )
@@ -441,11 +433,9 @@ class ClaudeWatcherApp(App):
 
     def _done_summary_cells(self, pid: int, done: list[SubagentInfo]) -> list:
         marker = "▾" if pid in self._done_open else "▸"
-        total = sum(i.output_tokens or 0 for i in done)
         return [
             Text(f"  {marker} {len(done)} done", style="grey50"),
-            "", "", "", "", "", "",
-            _fmt_tokens(total),
+            "", "", "", "", "", "",  # MODE..CPU%
             "",  # CTX
             "",  # MODEL
             Text("finished subagents", style="grey50"),
@@ -493,7 +483,6 @@ class ClaudeWatcherApp(App):
             cwd = "*" + cwd
         if s.jsonl_path and not s.cwd_validated:
             cwd = "!" + cwd
-        out_tok = _fmt_tokens(s.total_output_tokens)
         msg = _msg_cell(st.last_text if st else None, state)
         # Disclosure marker only when there's something to expand into.
         marker = ""
@@ -507,7 +496,6 @@ class ClaudeWatcherApp(App):
             cwd,
             _fmt_etime(s.proc.etime),
             f"{s.proc.cpu:.1f}",
-            out_tok,
             _ctx_cell(st),
             _fmt_model(st.model if st else None),
             msg,
@@ -531,7 +519,6 @@ class ClaudeWatcherApp(App):
             "",  # CWD — subagents share the parent's
             "",  # ETIME — not a process
             "",  # CPU% — not a process
-            _fmt_tokens(info.output_tokens),
             _ctx_cell(st),
             _fmt_model(st.model if st else None),
             _msg_cell(st.last_text if st else None, msg_state),
