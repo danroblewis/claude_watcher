@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,14 @@ def _shorten_msg(text: str | None, width: int = 60) -> str:
 def _msg_cell(text: str | None, state: State) -> Text:
     """The MSG cell, dimmed once the session is idle (turn finished)."""
     return Text(_shorten_msg(text), style="grey50" if state is State.IDLE else "")
+
+
+def _fmt_model(model: str | None) -> str:
+    """Compact model name: claude-haiku-4-5-20251001 -> haiku-4-5."""
+    if not model or model.startswith("<"):  # skip None and markers like <synthetic>
+        return ""
+    name = model.removeprefix("claude-")
+    return re.sub(r"-\d{8}$", "", name)  # drop a trailing date snapshot
 
 
 def _fmt_tokens(n: int | None) -> str:
@@ -340,7 +349,7 @@ class ClaudeWatcherApp(App):
     def on_mount(self) -> None:
         table = self.query_one("#procs", DataTable)
         table.add_columns(
-            "PID", "MODE", "STATE", "TOOL", "CWD", "ETIME", "CPU%", "OUT-TOK", "CTX", "MSG"
+            "PID", "MODE", "STATE", "TOOL", "CWD", "ETIME", "CPU%", "OUT-TOK", "CTX", "MODEL", "MSG"
         )
         feed = self.query_one("#feed", RichLog)
         feed.write(Text("Select a session (↑/↓) to watch its live feed.", style="grey50"))
@@ -439,7 +448,8 @@ class ClaudeWatcherApp(App):
             Text(f"  {marker} {len(done)} done", style="grey50"),
             "", "", "", "", "", "",
             _fmt_tokens(total),
-            "",
+            "",  # CTX
+            "",  # MODEL
             Text("finished subagents", style="grey50"),
         ]
 
@@ -501,6 +511,7 @@ class ClaudeWatcherApp(App):
             f"{s.proc.cpu:.1f}",
             out_tok,
             _ctx_cell(st),
+            _fmt_model(st.model if st else None),
             msg,
         ]
 
@@ -524,6 +535,7 @@ class ClaudeWatcherApp(App):
             "",  # CPU% — not a process
             _fmt_tokens(info.output_tokens),
             _ctx_cell(st),
+            _fmt_model(st.model if st else None),
             _msg_cell(st.last_text if st else None, msg_state),
         ]
 
