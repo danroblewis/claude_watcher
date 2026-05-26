@@ -21,7 +21,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Header, Label, RichLog
+from textual.widgets import Button, DataTable, Footer, Header, Label, RichLog, Static
 
 from claude_watcher.jsonl import read_incremental, read_tail, stat_file
 from claude_watcher.models import FeedEvent, Mode, Session, State, SubagentInfo
@@ -92,6 +92,55 @@ def _fmt_tokens(n: int | None) -> str:
     if n < 999_500:  # below the point where rounding would print "1000.0k"
         return f"{n / 1000:.1f}k"
     return f"{n / 1_000_000:.1f}m"
+
+
+def _split_height(mouse_y: int, top: int, bottom: int, min_above: int = 3, min_below: int = 3) -> int:
+    """Height (rows) for the pane above a splitter dragged to screen row
+    `mouse_y`, where the stack spans rows [top, bottom). The splitter itself
+    takes one row; both panes keep at least their minimums."""
+    max_above = (bottom - top) - 1 - min_below
+    return max(min_above, min(mouse_y - top, max_above))
+
+
+class Splitter(Static):
+    """A draggable 1-row bar that resizes the DataTable above it."""
+
+    DEFAULT_CSS = """
+    Splitter {
+        height: 1;
+        width: 100%;
+        background: $panel;
+        color: $text-muted;
+        text-align: center;
+    }
+    Splitter:hover {
+        background: $primary;
+        color: $text;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__("⇕")
+        self._dragging = False
+
+    def on_mouse_down(self, event) -> None:
+        self._dragging = True
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        self._dragging = False
+        self.release_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        if not self._dragging:
+            return
+        table = self.app.query_one("#procs", DataTable)
+        container = self.parent
+        top = table.region.y
+        bottom = container.region.y + container.region.height
+        table.styles.height = _split_height(event.screen_y, top, bottom)
 
 
 def _ctx_cell(st) -> Text:
@@ -241,7 +290,6 @@ class ClaudeWatcherApp(App):
     CSS = """
     DataTable {
         height: 45%;
-        border-bottom: heavy $panel;
     }
     RichLog {
         height: 1fr;
@@ -278,6 +326,7 @@ class ClaudeWatcherApp(App):
         yield Header(show_clock=True)
         with Vertical():
             yield DataTable(id="procs", cursor_type="row", zebra_stripes=True)
+            yield Splitter()
             yield RichLog(id="feed", highlight=False, markup=False, wrap=True, auto_scroll=True)
         yield Footer()
 
