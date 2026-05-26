@@ -182,26 +182,20 @@ def _agent_tag(path: str) -> str:
 
 
 def _subagent_key(pid: int, path: str) -> str:
-    """Row key for an active subagent row."""
+    """Row key for a subagent row (active, or done when 'show done' is on)."""
     return f"sub:{pid}:{path}"
 
 
-def _done_subagent_key(pid: int, path: str) -> str:
-    """Row key for a finished subagent row (shown under the 'done' section)."""
-    return f"dsub:{pid}:{path}"
-
-
 def _done_summary_key(pid: int) -> str:
-    """Row key for the collapsible 'N done' summary row."""
+    """Row key for the 'N done' summary row shown when done are hidden."""
     return f"done:{pid}"
 
 
 def _parse_subagent_key(key: str) -> tuple[int, str] | None:
-    """(pid, subagent_path) for an active or done subagent row, else None."""
-    for prefix in ("sub:", "dsub:"):
-        if key.startswith(prefix):
-            _, pid_str, path = key.split(":", 2)  # path may contain ':'; maxsplit keeps it whole
-            return int(pid_str), path
+    """(pid, subagent_path) for a subagent row, else None."""
+    if key.startswith("sub:"):
+        _, pid_str, path = key.split(":", 2)  # path may contain ':'; maxsplit keeps it whole
+        return int(pid_str), path
     return None
 
 
@@ -309,6 +303,7 @@ class ClaudeWatcherApp(App):
         Binding("k", "kill_session", "Kill"),
         Binding("right", "expand", "Expand", priority=True),
         Binding("left", "collapse", "Collapse", priority=True),
+        Binding("d", "toggle_done", "Done subagents"),
     ]
 
     def __init__(self) -> None:
@@ -317,7 +312,7 @@ class ClaudeWatcherApp(App):
         self._ledger = TokenLedger()
         self._sessions: dict[int, Session] = {}
         self._expanded: set[int] = set()  # pids whose subagents are shown
-        self._show_done: set[int] = set()  # pids whose 'done' section is expanded
+        self._show_done: bool = False  # global: show finished subagents as rows
         self._table_keys: list[str] = []  # ordered row keys currently in the table
         self.selected_pid: int | None = None  # owning process of the selected row
         self._selected_key: str | None = None  # full key of the selected table row
@@ -402,8 +397,8 @@ class ClaudeWatcherApp(App):
 
     def _build_rows(self, sessions: list[Session]) -> list[tuple[str, list]]:
         """Ordered (row_key, cells): each session; when expanded, its active
-        subagents individually and its finished ones folded into one 'done'
-        summary row (itself expandable)."""
+        subagents as rows. Finished subagents show as rows too when 'show done'
+        (the `d` toggle) is on, otherwise as one compact 'N done' summary row."""
         rows: list[tuple[str, list]] = []
         for s in sessions:
             pid = s.proc.pid
@@ -413,22 +408,23 @@ class ClaudeWatcherApp(App):
             for info in (i for i in s.subagents if i.active):
                 rows.append((_subagent_key(pid, info.path), self._subagent_row_cells(info)))
             done = [i for i in s.subagents if not i.active]
-            if done:
-                rows.append((_done_summary_key(pid), self._done_summary_cells(pid, done)))
-                if pid in self._show_done:
-                    for info in done:
-                        rows.append((_done_subagent_key(pid, info.path), self._subagent_row_cells(info)))
+            if not done:
+                continue
+            if self._show_done:
+                for info in done:
+                    rows.append((_subagent_key(pid, info.path), self._subagent_row_cells(info)))
+            else:
+                rows.append((_done_summary_key(pid), self._done_summary_cells(done)))
         return rows
 
-    def _done_summary_cells(self, pid: int, done: list[SubagentInfo]) -> list:
-        marker = "▾" if pid in self._show_done else "▸"
+    def _done_summary_cells(self, done: list[SubagentInfo]) -> list:
         total = sum(i.output_tokens or 0 for i in done)
         return [
-            Text(f"  {marker} {len(done)} done", style="grey50"),
+            Text(f"  · {len(done)} done", style="grey50"),
             "", "", "", "", "", "",
             _fmt_tokens(total),
             "",
-            Text("finished subagents", style="grey50"),
+            Text("press d to show", style="grey50"),
         ]
 
     def _populate_table(self, sessions: list[Session]) -> None:
@@ -664,24 +660,28 @@ class ClaudeWatcherApp(App):
         except Exception:
             return None
 
+    def _row_pid(self, key: str | None) -> int | None:
+        """The owning session pid for any row key (parent, subagent, summary)."""
+        if key is None:
+            return None
+        sub = _parse_subagent_key(key)
+        if sub is not None:
+            return sub[0]
+        done_pid = _parse_done_summary_key(key)
+        if done_pid is not None:
+            return done_pid
+        try:
+            return int(key)
+        except ValueError:
+            return None
+
     def action_expand(self) -> None:
         if len(self.screen_stack) > 1:  # a modal is up; leave arrows to it
             return
         key = self._current_row_key()
-        if key is None:
+        if key is None or not key.isdigit():  # only a parent row expands
             return
-        done_pid = _parse_done_summary_key(key)
-        if done_pid is not None:  # open the 'done' section
-            if done_pid not in self._show_done:
-                self._show_done.add(done_pid)
-                self.refresh_procs()
-            return
-        if _parse_subagent_key(key) is not None:  # subagent rows don't expand
-            return
-        try:
-            pid = int(key)
-        except ValueError:
-            return
+        pid = int(key)
         session = self._sessions.get(pid)
         if session and session.subagent_paths and pid not in self._expanded:
             self._expanded.add(pid)
@@ -690,40 +690,16 @@ class ClaudeWatcherApp(App):
     def action_collapse(self) -> None:
         if len(self.screen_stack) > 1:
             return
-        key = self._current_row_key()
-        if key is None:
-            return
-        # left closes the nearest open container, then selects its header row.
-        sub = _parse_subagent_key(key)
-        if sub is not None:
-            pid = sub[0]
-            if key.startswith("dsub:"):  # a done subagent -> close the done section
-                self._show_done.discard(pid)
-                self._selected_key = _done_summary_key(pid)
-            else:  # an active subagent -> close the whole session
-                self._expanded.discard(pid)
-                self._show_done.discard(pid)
-                self._selected_key = str(pid)
-            self.refresh_procs()
-            return
-        done_pid = _parse_done_summary_key(key)
-        if done_pid is not None:
-            if done_pid in self._show_done:  # close just the done section
-                self._show_done.discard(done_pid)
-                self._selected_key = _done_summary_key(done_pid)
-            else:  # already closed -> collapse the parent
-                self._expanded.discard(done_pid)
-                self._selected_key = str(done_pid)
-            self.refresh_procs()
-            return
-        try:
-            pid = int(key)
-        except ValueError:
-            return
-        if pid in self._expanded:
+        pid = self._row_pid(self._current_row_key())
+        if pid is not None and pid in self._expanded:
             self._expanded.discard(pid)
-            self._show_done.discard(pid)
+            self._selected_key = str(pid)  # land on the (now collapsed) parent
             self.refresh_procs()
+
+    def action_toggle_done(self) -> None:
+        self._show_done = not self._show_done
+        self.notify(f"Finished subagents {'shown' if self._show_done else 'hidden'}")
+        self.refresh_procs()
 
     def action_toggle_follow(self) -> None:
         self.follow = not self.follow
