@@ -310,6 +310,12 @@ class ClaudeWatcherApp(App):
             if not s.jsonl_path:
                 continue
             s.total_output_tokens = self._ledger.output_tokens(s.jsonl_path)
+            # The ledger's last text spans the whole file, so MSG stays filled
+            # even when the recent tail is all tool calls.
+            if s.status is not None:
+                text = self._ledger.last_text(s.jsonl_path)
+                if text is not None:
+                    s.status.last_text = text
             s.subagent_paths = [str(p) for p in sorted(list_subagent_files(s.jsonl_path))]
             if s.proc.pid in self._expanded:
                 s.subagents = self._build_subagent_infos(s)
@@ -323,6 +329,10 @@ class ClaudeWatcherApp(App):
         for path in session.subagent_paths:
             entries, _ = read_tail(path)
             status = derive_status(entries, now) if entries else None
+            if status is not None:
+                text = self._ledger.last_text(path)
+                if text is not None:
+                    status.last_text = text
             st = stat_file(path)
             active = bool(st and now_epoch - st[1] <= SUBAGENT_ACTIVE_WINDOW)
             infos.append(

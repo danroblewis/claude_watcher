@@ -37,9 +37,10 @@ from claude_watcher.status import (
     "cwd,expected",
     [
         ("/Users/x/project", "-Users-x-project"),
-        ("/Users/x/claude_watcher", "-Users-x-claude_watcher"),  # underscore kept
+        ("/Users/x/claude_watcher", "-Users-x-claude-watcher"),  # underscore -> dash
         ("/Users/x/.foo/bar", "-Users-x--foo-bar"),  # leading dot -> -, and / -> -
         ("/a/b.c.d/e", "-a-b-c-d-e"),  # every dot becomes a dash
+        ("/a/b c/d", "-a-b-c-d"),  # spaces too
     ],
 )
 def test_encode_project_dir(cwd, expected):
@@ -389,6 +390,51 @@ def test_token_ledger_incremental_no_double_count(tmp_path):
         f.write(_assistant_line("msgB", 25))
         f.write(_assistant_line("msgA", 100))
     assert ledger.output_tokens(str(parent)) == 125  # 100 + 25, msgA not doubled
+
+
+def _assistant_text_line(mid, text):
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "id": mid,
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"output_tokens": 1},
+            },
+        }
+    ) + "\n"
+
+
+def test_token_ledger_tracks_last_text_past_the_tail(tmp_path):
+    parent = tmp_path / "sess.jsonl"
+    # An old text message, then a lot of tool-only activity after it (no text).
+    parent.write_text(
+        _assistant_text_line("m1", "the last thing I said")
+        + _assistant_line("m2", 10) * 200  # tool/usage lines without any text
+    )
+    ledger = TokenLedger()
+    ledger.output_tokens(str(parent))
+    assert ledger.last_text(str(parent)) == "the last thing I said"
+
+
+def test_token_ledger_last_text_updates_and_persists(tmp_path):
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text(_assistant_text_line("m1", "first"))
+    ledger = TokenLedger()
+    ledger.output_tokens(str(parent))
+    assert ledger.last_text(str(parent)) == "first"
+
+    with open(parent, "a") as f:
+        f.write(_assistant_text_line("m2", "second"))
+    ledger.output_tokens(str(parent))
+    assert ledger.last_text(str(parent)) == "second"
+
+    # Appending text-free lines must not blank the remembered message.
+    with open(parent, "a") as f:
+        f.write(_assistant_line("m3", 5))
+    ledger.output_tokens(str(parent))
+    assert ledger.last_text(str(parent)) == "second"
 
 
 def test_token_ledger_per_file_output(tmp_path):

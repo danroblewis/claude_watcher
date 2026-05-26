@@ -10,6 +10,7 @@ the ``cwd`` field embedded in the file's entries.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,11 +35,12 @@ CPU_BUSY_THRESHOLD = 1.0  # percent
 def encode_project_dir(cwd: str) -> str:
     """Encode an absolute cwd into Claude's project-dir name.
 
-    Claude replaces both '/' and '.' with '-'. The transform is lossy and
-    forward-only — never try to decode it; instead validate via the in-file
-    cwd field.
+    Claude replaces every character outside ``[A-Za-z0-9]`` — ``/``, ``.``,
+    ``_``, spaces, and so on — with ``-`` (e.g. ``claude_watcher`` becomes
+    ``claude-watcher``). The transform is lossy and forward-only — never try
+    to decode it; instead validate via the in-file cwd field.
     """
-    return cwd.replace("/", "-").replace(".", "-")
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
 def resolve_jsonl(cwd: str, projects_dir: Path = PROJECTS_DIR) -> list[Path]:
