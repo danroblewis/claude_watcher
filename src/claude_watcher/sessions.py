@@ -148,7 +148,9 @@ def _status_for(path: Path, cpu: float) -> tuple:
     entries, _ = read_tail(path)
     status = derive_status(entries, datetime.now(timezone.utc)) if entries else None
     if status is not None:
-        active = active_subagent_count(path, st[1] if st else None)
+        # Count against real now (not the parent's mtime), so the "(N)" badge
+        # matches the active subagent rows the expanded view shows.
+        active = active_subagent_count(path)
         apply_runtime_overrides(status, cpu, active)
     return status, size, mtime
 

@@ -15,6 +15,7 @@ from claude_watcher.procs import classify_mode, is_watchable, terminate_proc
 from claude_watcher.models import Mode
 from claude_watcher.models import Status
 from claude_watcher.sessions import (
+    _status_for,
     active_subagent_count,
     apply_runtime_overrides,
     encode_project_dir,
@@ -318,6 +319,34 @@ def test_count_subagents_none_when_no_dir(tmp_path):
     parent = tmp_path / "sess.jsonl"
     parent.write_bytes(b"{}\n")
     assert active_subagent_count(parent) == 0
+
+
+def test_status_active_count_uses_real_now_not_parent_mtime(tmp_path):
+    import os
+    import time
+
+    # Parent blocked on a Task dispatch a while ago: its own mtime is old.
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text(
+        '{"type": "assistant", "timestamp": "2026-05-24T00:00:00Z",'
+        ' "message": {"role": "assistant", "stop_reason": "tool_use",'
+        ' "content": [{"type": "tool_use", "name": "Task", "input": {}}]}}\n'
+    )
+    old = time.time() - 120
+    os.utime(parent, (old, old))
+
+    subs = tmp_path / "sess" / "subagents"
+    subs.mkdir(parents=True)
+    fresh = subs / "agent-aaaa1111.jsonl"
+    stale = subs / "agent-bbbb2222.jsonl"
+    fresh.write_bytes(b"{}\n")  # written just now -> active
+    stale.write_bytes(b"{}\n")
+    os.utime(stale, (old + 20, old + 20))  # 100s ago: after the parent, but long done
+
+    status, _, _ = _status_for(parent, cpu=0.0)
+    # Only the fresh subagent counts; the stale one must not be inflated in just
+    # because it was written after the parent's last write.
+    assert status.active_subagents == 1
 
 
 # -- token ledger -------------------------------------------------------------
