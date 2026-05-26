@@ -32,7 +32,7 @@ from claude_watcher.sessions import (
     build_sessions,
     list_subagent_files,
 )
-from claude_watcher.status import context_percent, derive_status, parse_entry
+from claude_watcher.status import derive_status, parse_entry
 from claude_watcher.tokens import TokenLedger
 
 PROC_INTERVAL = 2.0
@@ -158,12 +158,10 @@ class Splitter(Static):
 
 
 def _ctx_cell(st) -> Text:
-    """Color-coded context-fill percentage: green < 50, yellow < 80, red above."""
-    pct = context_percent(st.context_tokens, st.model) if st else None
-    if pct is None:
-        return Text("")
-    style = "green" if pct < 50 else "yellow" if pct < 80 else "bold red"
-    return Text(f"{pct:.0f}%", style=style)
+    """Context size as a raw token count (input + cache). We can't show a
+    percentage because the transcript doesn't record the window — a 200k and a
+    1M-beta session look identical until the latter passes 200k."""
+    return Text(_fmt_tokens(st.context_tokens if st else None))
 
 
 def _fmt_time(ts: datetime | None) -> str:

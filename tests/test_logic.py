@@ -23,8 +23,6 @@ from claude_watcher.sessions import (
     subagent_dir,
 )
 from claude_watcher.status import (
-    context_percent,
-    context_window,
     derive_status,
     parse_entry,
     parse_timestamp,
@@ -296,19 +294,9 @@ def test_derive_status_context_fill():
         }
     ]
     s = derive_status(entries, NOW)
+    # Context fill is input + both cache fields (the whole prompt size).
     assert s.context_tokens == 4156 + 102236 + 11347  # 117739
     assert s.model == "claude-opus-4-7"
-    assert round(context_percent(s.context_tokens, s.model), 1) == 58.9
-
-
-def test_context_window_defaults_and_bumps():
-    assert context_window("claude-opus-4-7", 50_000) == 200_000  # standard default
-    assert context_window("claude-opus-4-7[1m]", 50_000) == 1_000_000  # explicit 1m tag
-    assert context_window("claude-opus-4-7", 250_000) == 1_000_000  # proof: exceeds 200k
-
-
-def test_context_percent_none_when_unknown():
-    assert context_percent(None, "claude-opus-4-7") is None
 
 
 # -- subagents ----------------------------------------------------------------
