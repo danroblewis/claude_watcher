@@ -6,7 +6,7 @@ stays trivially unit-testable without Textual or a live system.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -61,6 +61,17 @@ class Status:
 
 
 @dataclass
+class SubagentInfo:
+    """Display snapshot of one subagent transcript under a parent session."""
+
+    path: str
+    tag: str  # short id from the filename, e.g. "a16d"
+    status: Status | None = None  # derived from the subagent's own transcript
+    output_tokens: int | None = None  # deduped output tokens for this subagent
+    active: bool = False  # transcript written within the active window
+
+
+@dataclass
 class Session:
     """A process paired with the JSONL file it is (heuristically) writing."""
 
@@ -73,6 +84,8 @@ class Session:
     file_size: int | None = None
     file_mtime: datetime | None = None  # UTC
     total_output_tokens: int | None = None  # deduped sum across parent+subagents
+    subagent_paths: list[str] = field(default_factory=list)  # all subagent transcripts
+    subagents: list[SubagentInfo] = field(default_factory=list)  # populated when expanded
 
 
 @dataclass

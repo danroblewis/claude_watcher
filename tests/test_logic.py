@@ -362,6 +362,21 @@ def test_token_ledger_incremental_no_double_count(tmp_path):
     assert ledger.output_tokens(str(parent)) == 125  # 100 + 25, msgA not doubled
 
 
+def test_token_ledger_per_file_output(tmp_path):
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text(_assistant_line("msgA", 100))
+    subs = tmp_path / "sess" / "subagents"
+    subs.mkdir(parents=True)
+    sub = subs / "agent-aaaa1111.jsonl"
+    sub.write_text(_assistant_line("msgC", 200))
+
+    ledger = TokenLedger()
+    assert ledger.file_output_tokens(str(sub)) is None  # not ingested yet
+    ledger.output_tokens(str(parent))  # ingests parent + subagents
+    assert ledger.file_output_tokens(str(parent)) == 100
+    assert ledger.file_output_tokens(str(sub)) == 200
+
+
 def test_token_ledger_recounts_after_truncation(tmp_path):
     parent = tmp_path / "sess.jsonl"
     parent.write_text(_assistant_line("msgA", 100) + _assistant_line("msgB", 50))

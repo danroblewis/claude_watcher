@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,10 +23,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Label, RichLog
 
 from claude_watcher.jsonl import read_incremental, read_tail, stat_file
-from claude_watcher.models import FeedEvent, Mode, Session, State
+from claude_watcher.models import FeedEvent, Mode, Session, State, SubagentInfo
 from claude_watcher.procs import discover_procs, terminate_proc
-from claude_watcher.sessions import build_sessions, list_subagent_files
-from claude_watcher.status import context_percent, parse_entry
+from claude_watcher.sessions import (
+    SUBAGENT_ACTIVE_WINDOW,
+    build_sessions,
+    list_subagent_files,
+)
+from claude_watcher.status import context_percent, derive_status, parse_entry
 from claude_watcher.tokens import TokenLedger
 
 PROC_INTERVAL = 2.0
@@ -119,6 +124,19 @@ def _agent_tag(path: str) -> str:
     """Short label for a subagent file, e.g. agent-a708f58….jsonl -> a708."""
     stem = Path(path).stem  # agent-a708f5857f3fde650
     return stem.removeprefix("agent-")[:4] or stem
+
+
+def _subagent_key(pid: int, path: str) -> str:
+    """Table row key for a subagent row: parses back via ``_parse_subagent_key``."""
+    return f"sub:{pid}:{path}"
+
+
+def _parse_subagent_key(key: str) -> tuple[int, str] | None:
+    """(pid, subagent_path) for a subagent row key, or None if it isn't one."""
+    if not key.startswith("sub:"):
+        return None
+    _, pid_str, path = key.split(":", 2)  # path may contain ':'; maxsplit keeps it whole
+    return int(pid_str), path
 
 
 def _feed_line(ev: FeedEvent, tag: str | None = None) -> Text:
@@ -217,6 +235,8 @@ class ClaudeWatcherApp(App):
         Binding("r", "refresh_now", "Refresh"),
         Binding("f", "toggle_follow", "Follow"),
         Binding("k", "kill_session", "Kill"),
+        Binding("right", "expand", "Expand", priority=True),
+        Binding("left", "collapse", "Collapse", priority=True),
     ]
 
     def __init__(self) -> None:
@@ -224,9 +244,13 @@ class ClaudeWatcherApp(App):
         self._self_pid = os.getpid()
         self._ledger = TokenLedger()
         self._sessions: dict[int, Session] = {}
-        self.selected_pid: int | None = None
+        self._expanded: set[int] = set()  # pids whose subagents are shown
+        self.selected_pid: int | None = None  # owning process of the selected row
+        self._selected_key: str | None = None  # full key of the selected table row
         self._feed_parent: str | None = None  # parent session jsonl path
-        self._feed_offsets: dict[str, int] = {}  # path -> byte offset (parent + subagents)
+        self._feed_focus: str | None = None  # a subagent path to show alone, or None
+        self._feed_offsets: dict[str, int] = {}  # path -> byte offset
+        self._feed_gen: int = 0  # bumped on every selection change; stale workers bail
         self.follow: bool = True
 
     def compose(self) -> ComposeResult:
@@ -262,31 +286,57 @@ class ClaudeWatcherApp(App):
         # subagents), so it lives in the stateful ledger rather than the
         # tail-window status. Runs here, off the event loop.
         for s in sessions:
-            if s.jsonl_path:
-                s.total_output_tokens = self._ledger.output_tokens(s.jsonl_path)
+            if not s.jsonl_path:
+                continue
+            s.total_output_tokens = self._ledger.output_tokens(s.jsonl_path)
+            s.subagent_paths = [str(p) for p in sorted(list_subagent_files(s.jsonl_path))]
+            if s.proc.pid in self._expanded:
+                s.subagents = self._build_subagent_infos(s)
         return sessions
+
+    def _build_subagent_infos(self, session: Session) -> list[SubagentInfo]:
+        """Tail each subagent transcript for an expanded session (off-loop)."""
+        now = datetime.now(timezone.utc)
+        now_epoch = time.time()
+        infos: list[SubagentInfo] = []
+        for path in session.subagent_paths:
+            entries, _ = read_tail(path)
+            status = derive_status(entries, now) if entries else None
+            st = stat_file(path)
+            active = bool(st and now_epoch - st[1] <= SUBAGENT_ACTIVE_WINDOW)
+            infos.append(
+                SubagentInfo(
+                    path=path,
+                    tag=_agent_tag(path),
+                    status=status,
+                    output_tokens=self._ledger.file_output_tokens(path),
+                    active=active,
+                )
+            )
+        return infos
 
     def _populate_table(self, sessions: list[Session]) -> None:
         table = self.query_one("#procs", DataTable)
-        prev = self.selected_pid
+        prev = self._selected_key
         table.clear()
-        pids: list[int] = []
+        keys: list[str] = []
         for s in sessions:
-            pids.append(s.proc.pid)
-            table.add_row(*self._row_cells(s), key=str(s.proc.pid))
+            key = str(s.proc.pid)
+            keys.append(key)
+            table.add_row(*self._row_cells(s), key=key)
+            if s.proc.pid in self._expanded:
+                for info in s.subagents:
+                    subkey = _subagent_key(s.proc.pid, info.path)
+                    keys.append(subkey)
+                    table.add_row(*self._subagent_row_cells(info), key=subkey)
 
-        if not pids:
-            self.selected_pid = None
-            self._switch_feed(None)
+        if not keys:
+            self._apply_selection(None)
             return
 
-        target = prev if prev in pids else pids[0]
-        try:
-            index = pids.index(target)
-            table.move_cursor(row=index, animate=False)
-        except ValueError:
-            pass
-        self._switch_feed(target)
+        target = prev if prev in keys else keys[0]
+        table.move_cursor(row=keys.index(target), animate=False)
+        self._apply_selection(target)
 
     def _row_cells(self, s: Session) -> list:
         st = s.status
@@ -304,8 +354,12 @@ class ClaudeWatcherApp(App):
             cwd = "!" + cwd
         out_tok = _fmt_tokens(s.total_output_tokens)
         msg = _shorten_msg(st.last_text if st else None)
+        # Disclosure marker when a session has subagents to expand into.
+        marker = ""
+        if s.subagent_paths:
+            marker = "▾ " if s.proc.pid in self._expanded else "▸ "
         return [
-            str(s.proc.pid),
+            f"{marker}{s.proc.pid}",
             mode_cell,
             state_cell,
             tool,
@@ -317,55 +371,99 @@ class ClaudeWatcherApp(App):
             msg,
         ]
 
+    def _subagent_row_cells(self, info: SubagentInfo) -> list:
+        st = info.status
+        if info.active:
+            state = st.state if st else State.UNKNOWN
+            state_cell = Text(state.value, style=_STATE_STYLE.get(state, "white"))
+        else:
+            state_cell = Text("done", style="grey50")
+        tool = (st.tool_name if st and st.tool_name else "") or ""
+        return [
+            Text(f"  └ {info.tag}", style="magenta"),
+            "sub",
+            state_cell,
+            tool,
+            "",  # CWD — subagents share the parent's
+            "",  # ETIME — not a process
+            "",  # CPU% — not a process
+            _fmt_tokens(info.output_tokens),
+            _ctx_cell(st),
+            _shorten_msg(st.last_text if st else None),
+        ]
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         key = event.row_key
-        if key is None or key.value is None:
+        if key is not None and key.value is not None:
+            self._apply_selection(key.value)
+
+    def _apply_selection(self, key: str | None) -> None:
+        """Point the feed at whatever row `key` names (parent or subagent)."""
+        self._selected_key = key
+        if key is None:
+            self.selected_pid = None
+            self._switch_feed(None, None)
+            return
+        sub = _parse_subagent_key(key)
+        if sub is not None:
+            pid, sub_path = sub
+            self.selected_pid = pid  # kill still targets the owning process
+            session = self._sessions.get(pid)
+            self._switch_feed(session.jsonl_path if session else None, sub_path)
             return
         try:
-            pid = int(key.value)
+            pid = int(key)
         except ValueError:
             return
-        self._switch_feed(pid)
+        self.selected_pid = pid
+        session = self._sessions.get(pid)
+        self._switch_feed(session.jsonl_path if session else None, None)
 
     # -- live feed ------------------------------------------------------------
 
-    def _switch_feed(self, pid: int | None) -> None:
-        """Point the feed at a session. Idempotent for the current selection."""
-        session = self._sessions.get(pid) if pid is not None else None
-        new_path = session.jsonl_path if session else None
-        if pid == self.selected_pid and new_path == self._feed_parent:
+    def _feed_read_paths(self) -> list[str]:
+        """Files the feed currently tails: one subagent if focused, else the
+        whole session (parent + subagents)."""
+        if self._feed_focus is not None:
+            return [self._feed_focus]
+        if self._feed_parent is None:
+            return []
+        return [self._feed_parent] + [str(p) for p in list_subagent_files(self._feed_parent)]
+
+    def _switch_feed(self, parent: str | None, focus: str | None) -> None:
+        """Point the feed at a session (focus=None) or one subagent. Idempotent."""
+        if parent == self._feed_parent and focus == self._feed_focus:
             return
 
-        self.selected_pid = pid
-        self._feed_parent = new_path
-        # Seed every offset at the current EOF synchronously — parent plus any
-        # subagent files already present — so the tail starts at the end and
+        self._feed_parent = parent
+        self._feed_focus = focus
+        self._feed_gen += 1
+        gen = self._feed_gen
+        # Seed every offset at the current EOF so the tail starts at the end and
         # never replays a huge file or a finished subagent's whole history.
         self._feed_offsets = {}
-        if new_path:
-            st = stat_file(new_path)
-            self._feed_offsets[new_path] = st[0] if st else 0
-            for sa in list_subagent_files(new_path):
-                sst = stat_file(sa)
-                self._feed_offsets[str(sa)] = sst[0] if sst else 0
+        for p in self._feed_read_paths():
+            st = stat_file(p)
+            self._feed_offsets[p] = st[0] if st else 0
 
         feed = self.query_one("#feed", RichLog)
         feed.clear()
-        if new_path is None:
-            if session is not None:
+        if parent is None:
+            if self.selected_pid is not None:
                 feed.write(Text("(no session file resolved for this process yet)", style="grey50"))
             return
-        title = Text(f"── {Path(new_path).stem}", style="bold")
-        if session and session.ambiguous:
-            title.append("  [ambiguous: shares cwd with another session]", style="red")
-        feed.write(title)
-        self._seed_feed(new_path)
+        if focus is not None:
+            feed.write(Text(f"── {_agent_tag(focus)}  [subagent]", style="bold magenta"))
+            self._seed_feed(focus, gen)
+        else:
+            feed.write(Text(f"── {Path(parent).stem}", style="bold"))
+            self._seed_feed(parent, gen)
 
     @work(exclusive=True, group="feed")
-    async def _seed_feed(self, path: str) -> None:
-        """Seed the feed with the parent's recent events for context."""
+    async def _seed_feed(self, path: str, gen: int) -> None:
+        """Seed the feed with a file's recent events for context."""
         entries, end_offset = await asyncio.to_thread(read_tail, path)
-        if path != self._feed_parent:
+        if gen != self._feed_gen:
             return  # selection changed while reading
         feed = self.query_one("#feed", RichLog)
         events = [ev for e in entries if (ev := parse_entry(e)) is not None]
@@ -375,13 +473,16 @@ class ClaudeWatcherApp(App):
 
     @work(exclusive=True, group="feed")
     async def refresh_feed(self) -> None:
-        parent = self._feed_parent
-        if not parent:
+        if self._feed_parent is None:
             return
+        gen = self._feed_gen
         events, new_offsets = await asyncio.to_thread(
-            self._collect_feed_updates, parent, dict(self._feed_offsets)
+            self._collect_feed_updates,
+            self._feed_parent,
+            self._feed_focus,
+            dict(self._feed_offsets),
         )
-        if parent != self._feed_parent:
+        if gen != self._feed_gen:
             return  # selection changed while reading
         feed = self.query_one("#feed", RichLog)
         for ev, tag in events:
@@ -389,27 +490,29 @@ class ClaudeWatcherApp(App):
         self._feed_offsets.update(new_offsets)
 
     def _collect_feed_updates(
-        self, parent: str, offsets: dict[str, int]
+        self, parent: str, focus: str | None, offsets: dict[str, int]
     ) -> tuple[list[tuple[FeedEvent, str | None]], dict[str, int]]:
-        """Read new lines from the parent and every subagent file (blocking).
+        """Read new lines from the tracked files (blocking).
 
-        Newly-spawned subagent files (not yet tracked) are read from the start
-        so their launch is captured; existing files are tailed from their
-        offset. Events from all files are merged and sorted by timestamp so the
-        interleaving reads chronologically.
+        Focused mode tails a single subagent. Session mode tails the parent and
+        every subagent; newly-spawned subagent files (not yet tracked) are read
+        from the start so their launch is captured. Events are merged and sorted
+        by timestamp so the interleaving reads chronologically.
         """
+        if focus is not None:
+            tracked = [focus]
+        else:
+            tracked = [parent] + [str(p) for p in list_subagent_files(parent)]
         paths = dict(offsets)
-        for sa in list_subagent_files(parent):
-            sp = str(sa)
-            if sp not in paths:
-                paths[sp] = 0  # new subagent -> capture from its beginning
+        for p in tracked:
+            paths.setdefault(p, 0)  # new file -> capture from its beginning
 
         collected: list[tuple] = []
         new_offsets: dict[str, int] = {}
         for path, off in paths.items():
             entries, new_off = read_incremental(path, off)
             new_offsets[path] = new_off
-            tag = None if path == parent else _agent_tag(path)
+            tag = None if focus is not None or path == parent else _agent_tag(path)
             for e in entries:
                 ev = parse_entry(e)
                 if ev is not None:
@@ -424,6 +527,51 @@ class ClaudeWatcherApp(App):
 
     def action_refresh_now(self) -> None:
         self.refresh_procs()
+
+    def _current_row_key(self) -> str | None:
+        table = self.query_one("#procs", DataTable)
+        if table.row_count == 0:
+            return None
+        try:
+            return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        except Exception:
+            return None
+
+    def action_expand(self) -> None:
+        if len(self.screen_stack) > 1:  # a modal is up; leave arrows to it
+            return
+        key = self._current_row_key()
+        if key is None or _parse_subagent_key(key) is not None:
+            return
+        try:
+            pid = int(key)
+        except ValueError:
+            return
+        session = self._sessions.get(pid)
+        if session and session.subagent_paths and pid not in self._expanded:
+            self._expanded.add(pid)
+            self.refresh_procs()  # re-discover so subagent rows get populated
+
+    def action_collapse(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
+        key = self._current_row_key()
+        if key is None:
+            return
+        sub = _parse_subagent_key(key)
+        if sub is not None:  # on a subagent row: collapse parent, select it
+            pid = sub[0]
+            self._expanded.discard(pid)
+            self._selected_key = str(pid)
+            self.refresh_procs()
+            return
+        try:
+            pid = int(key)
+        except ValueError:
+            return
+        if pid in self._expanded:
+            self._expanded.discard(pid)
+            self.refresh_procs()
 
     def action_toggle_follow(self) -> None:
         self.follow = not self.follow

@@ -39,6 +39,15 @@ class TokenLedger:
             total += sum(self._by_msg.get(path, {}).values())
         return total
 
+    def file_output_tokens(self, path: str) -> int | None:
+        """Output tokens for a single already-ingested file, or None if unseen.
+
+        Call ``output_tokens`` for the parent first; it ingests every subagent
+        file, so their per-file totals are then available here.
+        """
+        msgs = self._by_msg.get(path)
+        return sum(msgs.values()) if msgs is not None else None
+
     def _ingest(self, path: str) -> None:
         st = stat_file(path)
         if st is None:
