@@ -55,6 +55,8 @@ class Status:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
+    context_tokens: int | None = None  # latest prompt size (input+cache) = context fill
+    model: str | None = None  # latest assistant message's model, for window sizing
     active_subagents: int = 0  # subagent files with recently-advancing mtime
 
 
@@ -70,6 +72,7 @@ class Session:
     status: Status | None = None
     file_size: int | None = None
     file_mtime: datetime | None = None  # UTC
+    total_output_tokens: int | None = None  # deduped sum across parent+subagents
 
 
 @dataclass

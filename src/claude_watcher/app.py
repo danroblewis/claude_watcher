@@ -25,7 +25,8 @@ from claude_watcher.jsonl import read_incremental, read_tail, stat_file
 from claude_watcher.models import FeedEvent, Mode, Session, State
 from claude_watcher.procs import discover_procs, terminate_proc
 from claude_watcher.sessions import build_sessions, list_subagent_files
-from claude_watcher.status import parse_entry
+from claude_watcher.status import context_percent, parse_entry
+from claude_watcher.tokens import TokenLedger
 
 PROC_INTERVAL = 2.0
 FEED_INTERVAL = 0.75
@@ -74,6 +75,26 @@ def _shorten_msg(text: str | None, width: int = 60) -> str:
     if len(flat) > width:
         flat = flat[: width - 1].rstrip() + "…"
     return flat
+
+
+def _fmt_tokens(n: int | None) -> str:
+    """Compact token count: 9070 -> "9.1k", 6284048 -> "6.3m"."""
+    if n is None:
+        return ""
+    if n < 1000:
+        return str(n)
+    if n < 999_500:  # below the point where rounding would print "1000.0k"
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.1f}m"
+
+
+def _ctx_cell(st) -> Text:
+    """Color-coded context-fill percentage: green < 50, yellow < 80, red above."""
+    pct = context_percent(st.context_tokens, st.model) if st else None
+    if pct is None:
+        return Text("")
+    style = "green" if pct < 50 else "yellow" if pct < 80 else "bold red"
+    return Text(f"{pct:.0f}%", style=style)
 
 
 def _fmt_time(ts: datetime | None) -> str:
@@ -201,6 +222,7 @@ class ClaudeWatcherApp(App):
     def __init__(self) -> None:
         super().__init__()
         self._self_pid = os.getpid()
+        self._ledger = TokenLedger()
         self._sessions: dict[int, Session] = {}
         self.selected_pid: int | None = None
         self._feed_parent: str | None = None  # parent session jsonl path
@@ -216,7 +238,9 @@ class ClaudeWatcherApp(App):
 
     def on_mount(self) -> None:
         table = self.query_one("#procs", DataTable)
-        table.add_columns("PID", "MODE", "STATE", "TOOL", "CWD", "ETIME", "CPU%", "OUT-TOK", "MSG")
+        table.add_columns(
+            "PID", "MODE", "STATE", "TOOL", "CWD", "ETIME", "CPU%", "OUT-TOK", "CTX", "MSG"
+        )
         feed = self.query_one("#feed", RichLog)
         feed.write(Text("Select a session (↑/↓) to watch its live feed.", style="grey50"))
         self.refresh_procs()
@@ -233,7 +257,14 @@ class ClaudeWatcherApp(App):
 
     def _discover_blocking(self) -> list[Session]:
         procs = discover_procs(self._self_pid)
-        return build_sessions(procs)
+        sessions = build_sessions(procs)
+        # Cumulative token accounting needs to scan whole files (parent +
+        # subagents), so it lives in the stateful ledger rather than the
+        # tail-window status. Runs here, off the event loop.
+        for s in sessions:
+            if s.jsonl_path:
+                s.total_output_tokens = self._ledger.output_tokens(s.jsonl_path)
+        return sessions
 
     def _populate_table(self, sessions: list[Session]) -> None:
         table = self.query_one("#procs", DataTable)
@@ -271,9 +302,7 @@ class ClaudeWatcherApp(App):
             cwd = "*" + cwd
         if s.jsonl_path and not s.cwd_validated:
             cwd = "!" + cwd
-        out_tok = ""
-        if st and st.output_tokens is not None:
-            out_tok = str(st.output_tokens)
+        out_tok = _fmt_tokens(s.total_output_tokens)
         msg = _shorten_msg(st.last_text if st else None)
         return [
             str(s.proc.pid),
@@ -284,6 +313,7 @@ class ClaudeWatcherApp(App):
             _fmt_etime(s.proc.etime),
             f"{s.proc.cpu:.1f}",
             out_tok,
+            _ctx_cell(st),
             msg,
         ]
 

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_watcher.jsonl import read_tail, stat_file
-from claude_watcher.models import ProcEntry, Session, State
+from claude_watcher.models import ProcEntry, Session, State, Status
 from claude_watcher.status import derive_status
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
@@ -24,6 +24,11 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # many seconds — used to keep a parent that is blocked on subagents showing as
 # working rather than stalled.
 SUBAGENT_ACTIVE_WINDOW = 25.0
+
+# A process still using at least this much CPU is treated as working even when
+# its transcript looks stalled: a long generation streams to the terminal
+# without appending to the JSONL, so timestamp age alone yields false stalls.
+CPU_BUSY_THRESHOLD = 1.0  # percent
 
 
 def encode_project_dir(cwd: str) -> str:
@@ -109,12 +114,33 @@ def active_subagent_count(
     return count
 
 
-def _status_for(path: Path) -> tuple:
+def apply_runtime_overrides(
+    status: Status, cpu: float, active_subagents: int
+) -> Status:
+    """Correct a tail-derived state with live process signals (in place).
+
+    ``derive_status`` only sees the transcript, so it flags a session stalled
+    whenever the file has been quiet for a while. Two runtime signals override
+    that false reading: an active subagent (the parent is blocked waiting on
+    it) or a process still burning CPU (it is mid-generation, not stuck).
+    """
+    status.active_subagents = active_subagents
+    if active_subagents > 0 and status.state in (
+        State.STALLED,
+        State.WORKING,
+        State.UNKNOWN,
+    ):
+        status.state = State.WORKING
+    elif status.state is State.STALLED and cpu > CPU_BUSY_THRESHOLD:
+        status.state = State.WORKING
+    return status
+
+
+def _status_for(path: Path, cpu: float) -> tuple:
     """Read the tail of a jsonl and derive (status, size, mtime_utc).
 
-    Augments the derived status with subagent activity: a parent blocked on
-    running subagents would otherwise look stalled, so if any subagent is
-    active we annotate the count and keep the state as working.
+    The tail-derived status is then corrected with live process signals
+    (subagent activity, CPU) via ``apply_runtime_overrides``.
     """
     st = stat_file(path)
     size = st[0] if st else None
@@ -123,9 +149,7 @@ def _status_for(path: Path) -> tuple:
     status = derive_status(entries, datetime.now(timezone.utc)) if entries else None
     if status is not None:
         active = active_subagent_count(path, st[1] if st else None)
-        status.active_subagents = active
-        if active > 0 and status.state in (State.STALLED, State.WORKING, State.UNKNOWN):
-            status.state = State.WORKING
+        apply_runtime_overrides(status, cpu, active)
     return status, size, mtime
 
 
@@ -160,7 +184,7 @@ def build_sessions(
                 session.jsonl_path = str(jsonl_path)
                 session.session_id = jsonl_path.stem
                 session.cwd_validated = file_cwd(jsonl_path) == cwd
-                status, size, mtime = _status_for(jsonl_path)
+                status, size, mtime = _status_for(jsonl_path, proc.cpu)
                 session.status = status
                 session.file_size = size
                 session.file_mtime = mtime

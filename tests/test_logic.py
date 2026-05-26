@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
+import json
 import signal
 from datetime import datetime, timezone
 
 import pytest
 
 from claude_watcher.jsonl import read_incremental, read_tail
+from claude_watcher.tokens import TokenLedger
 from claude_watcher.models import State
 from claude_watcher.procs import classify_mode, is_watchable, terminate_proc
 from claude_watcher.models import Mode
+from claude_watcher.models import Status
 from claude_watcher.sessions import (
     active_subagent_count,
+    apply_runtime_overrides,
     encode_project_dir,
     list_subagent_files,
     subagent_dir,
 )
-from claude_watcher.status import derive_status, parse_entry, parse_timestamp
+from claude_watcher.status import (
+    context_percent,
+    context_window,
+    derive_status,
+    parse_entry,
+    parse_timestamp,
+)
 
 
 # -- path encoding ------------------------------------------------------------
@@ -239,6 +249,41 @@ def test_derive_status_tokens_and_text():
     assert s.output_tokens == 42 and s.last_text == "the answer"
 
 
+def test_derive_status_context_fill():
+    entries = [
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-24T00:00:20Z",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input_tokens": 4156,
+                    "cache_read_input_tokens": 102236,
+                    "cache_creation_input_tokens": 11347,
+                    "output_tokens": 9434,
+                },
+            },
+        }
+    ]
+    s = derive_status(entries, NOW)
+    assert s.context_tokens == 4156 + 102236 + 11347  # 117739
+    assert s.model == "claude-opus-4-7"
+    assert round(context_percent(s.context_tokens, s.model), 1) == 58.9
+
+
+def test_context_window_defaults_and_bumps():
+    assert context_window("claude-opus-4-7", 50_000) == 200_000  # standard default
+    assert context_window("claude-opus-4-7[1m]", 50_000) == 1_000_000  # explicit 1m tag
+    assert context_window("claude-opus-4-7", 250_000) == 1_000_000  # proof: exceeds 200k
+
+
+def test_context_percent_none_when_unknown():
+    assert context_percent(None, "claude-opus-4-7") is None
+
+
 # -- subagents ----------------------------------------------------------------
 
 def test_subagent_dir():
@@ -273,6 +318,83 @@ def test_count_subagents_none_when_no_dir(tmp_path):
     parent = tmp_path / "sess.jsonl"
     parent.write_bytes(b"{}\n")
     assert active_subagent_count(parent) == 0
+
+
+# -- token ledger -------------------------------------------------------------
+
+def _assistant_line(msg_id, out):
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {"id": msg_id, "role": "assistant", "usage": {"output_tokens": out}},
+        }
+    ) + "\n"
+
+
+def test_token_ledger_dedupes_and_includes_subagents(tmp_path):
+    parent = tmp_path / "sess.jsonl"
+    # msgA is logged across 3 content-block lines that repeat the same usage;
+    # it must count once (100), not 3x. msgB adds 50. A user line is ignored.
+    parent.write_text(
+        _assistant_line("msgA", 100) * 3
+        + _assistant_line("msgB", 50)
+        + '{"type": "user", "message": {"content": "hi"}}\n'
+    )
+    subs = tmp_path / "sess" / "subagents"
+    subs.mkdir(parents=True)
+    (subs / "agent-aaaa1111.jsonl").write_text(_assistant_line("msgC", 200) * 2)
+
+    ledger = TokenLedger()
+    # 150 (parent: 100 + 50) + 200 (subagent) = 350
+    assert ledger.output_tokens(str(parent)) == 350
+
+
+def test_token_ledger_incremental_no_double_count(tmp_path):
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text(_assistant_line("msgA", 100))
+    ledger = TokenLedger()
+    assert ledger.output_tokens(str(parent)) == 100
+
+    # Append a new message plus a duplicate line of the already-counted msgA.
+    with open(parent, "a") as f:
+        f.write(_assistant_line("msgB", 25))
+        f.write(_assistant_line("msgA", 100))
+    assert ledger.output_tokens(str(parent)) == 125  # 100 + 25, msgA not doubled
+
+
+def test_token_ledger_recounts_after_truncation(tmp_path):
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text(_assistant_line("msgA", 100) + _assistant_line("msgB", 50))
+    ledger = TokenLedger()
+    assert ledger.output_tokens(str(parent)) == 150
+
+    parent.write_text(_assistant_line("msgC", 30))  # shrinks the file
+    assert ledger.output_tokens(str(parent)) == 30
+
+
+# -- runtime state overrides --------------------------------------------------
+
+def test_cpu_override_keeps_busy_session_working():
+    # A stalled-looking transcript whose process is still burning CPU is really
+    # mid-generation, so it should read as working, not stalled.
+    s = apply_runtime_overrides(Status(state=State.STALLED), cpu=8.0, active_subagents=0)
+    assert s.state is State.WORKING
+
+
+def test_cpu_override_leaves_truly_idle_session_stalled():
+    s = apply_runtime_overrides(Status(state=State.STALLED), cpu=0.2, active_subagents=0)
+    assert s.state is State.STALLED
+
+
+def test_subagent_override_still_wins_and_count_recorded():
+    s = apply_runtime_overrides(Status(state=State.STALLED), cpu=0.0, active_subagents=3)
+    assert s.state is State.WORKING and s.active_subagents == 3
+
+
+def test_cpu_override_does_not_touch_idle_state():
+    # IDLE means the turn ended (waiting on the user); CPU must not flip it.
+    s = apply_runtime_overrides(Status(state=State.IDLE), cpu=50.0, active_subagents=0)
+    assert s.state is State.IDLE
 
 
 def test_derive_status_ignores_meta_entries():

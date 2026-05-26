@@ -20,6 +20,32 @@ _MEANINGFUL = {"assistant", "user"}
 
 _SNIPPET = 100  # max chars for a one-line feed entry / status text
 
+# Standard Claude context window; the 1M-token beta is the only larger option.
+_STANDARD_WINDOW = 200_000
+_LARGE_WINDOW = 1_000_000
+
+
+def context_window(model: str | None, context_tokens: int | None) -> int:
+    """Best-guess context window for a session.
+
+    Defaults to the standard 200k window (true for every current Claude model),
+    which biases toward over-reporting pressure — the safer error for a
+    monitor. Bumps to 1M only with proof: an explicit ``1m`` model tag, or an
+    observed prompt that already exceeds the standard window.
+    """
+    if model and "1m" in model.lower():
+        return _LARGE_WINDOW
+    if context_tokens is not None and context_tokens > _STANDARD_WINDOW:
+        return _LARGE_WINDOW
+    return _STANDARD_WINDOW
+
+
+def context_percent(context_tokens: int | None, model: str | None) -> float | None:
+    """Percentage of the context window currently filled, or None if unknown."""
+    if context_tokens is None:
+        return None
+    return 100.0 * context_tokens / context_window(model, context_tokens)
+
 
 def parse_timestamp(value: str | None) -> datetime | None:
     """Parse an ISO-8601 UTC timestamp (`...Z`) into an aware datetime."""
@@ -146,6 +172,15 @@ def derive_status(
         if entry.get("type") != "assistant":
             continue
         usage = (entry.get("message") or {}).get("usage") or {}
+        if status.context_tokens is None and usage:
+            # Context fill = the whole prompt sent on the latest request, which
+            # is the new input plus everything served from / written to cache.
+            status.context_tokens = (
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+            )
+            status.model = (entry.get("message") or {}).get("model")
         if status.input_tokens is None and usage:
             status.input_tokens = usage.get("input_tokens")
             status.output_tokens = usage.get("output_tokens")
