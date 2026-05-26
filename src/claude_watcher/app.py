@@ -19,6 +19,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Label, RichLog
 
@@ -245,6 +246,7 @@ class ClaudeWatcherApp(App):
         self._ledger = TokenLedger()
         self._sessions: dict[int, Session] = {}
         self._expanded: set[int] = set()  # pids whose subagents are shown
+        self._table_keys: list[str] = []  # ordered row keys currently in the table
         self.selected_pid: int | None = None  # owning process of the selected row
         self._selected_key: str | None = None  # full key of the selected table row
         self._feed_parent: str | None = None  # parent session jsonl path
@@ -315,27 +317,43 @@ class ClaudeWatcherApp(App):
             )
         return infos
 
-    def _populate_table(self, sessions: list[Session]) -> None:
-        table = self.query_one("#procs", DataTable)
-        prev = self._selected_key
-        table.clear()
-        keys: list[str] = []
+    def _build_rows(self, sessions: list[Session]) -> list[tuple[str, list]]:
+        """Ordered (row_key, cells) for the table: each session, plus its
+        subagent rows when expanded."""
+        rows: list[tuple[str, list]] = []
         for s in sessions:
-            key = str(s.proc.pid)
-            keys.append(key)
-            table.add_row(*self._row_cells(s), key=key)
+            rows.append((str(s.proc.pid), self._row_cells(s)))
             if s.proc.pid in self._expanded:
                 for info in s.subagents:
-                    subkey = _subagent_key(s.proc.pid, info.path)
-                    keys.append(subkey)
-                    table.add_row(*self._subagent_row_cells(info), key=subkey)
+                    rows.append((_subagent_key(s.proc.pid, info.path), self._subagent_row_cells(info)))
+        return rows
 
-        if not keys:
-            self._apply_selection(None)
+    def _populate_table(self, sessions: list[Session]) -> None:
+        table = self.query_one("#procs", DataTable)
+        rows = self._build_rows(sessions)
+        new_keys = [k for k, _ in rows]
+
+        # Fast path: the same rows in the same order (the steady-state poll).
+        # Update cells in place rather than clear()+re-add, which would blank
+        # the table for a frame and reset the scroll position — the flicker.
+        if new_keys and new_keys == self._table_keys:
+            for i, (_, cells) in enumerate(rows):
+                for j, cell in enumerate(cells):
+                    table.update_cell_at(Coordinate(i, j), cell, update_width=True)
             return
 
-        target = prev if prev in keys else keys[0]
-        table.move_cursor(row=keys.index(target), animate=False)
+        # Structure changed (rows added/removed/reordered, or expand/collapse):
+        # rebuild and restore the cursor onto the previously selected row.
+        prev = self._selected_key
+        table.clear()
+        for key, cells in rows:
+            table.add_row(*cells, key=key)
+        self._table_keys = new_keys
+        if not new_keys:
+            self._apply_selection(None)
+            return
+        target = prev if prev in new_keys else new_keys[0]
+        table.move_cursor(row=new_keys.index(target), animate=False)
         self._apply_selection(target)
 
     def _row_cells(self, s: Session) -> list:
